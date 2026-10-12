@@ -1,0 +1,6 @@
+{
+  "name": "NovaBuild AI",
+  "description": "An AI-powered application development platform inspired by modern AI studio workflows for generating, editing, previewing, and deploying full-stack web applications.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
