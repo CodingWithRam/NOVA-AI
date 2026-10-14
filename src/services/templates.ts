@@ -178,7 +178,7 @@ export default function App() {
           </div>
           <div>
             <h3 className="font-medium text-amber-400 mb-2">AI & Agents</h3>
-            <p className="text-zinc-400 leading-relaxed">Gemini SDK, Tool Calling, Vector Stores, RAG Pipelines</p>
+            <p className="text-zinc-400 leading-relaxed">Nova AI SDK, Tool Calling, Vector Stores, RAG Pipelines</p>
           </div>
           <div>
             <h3 className="font-medium text-rose-400 mb-2">DevOps</h3>

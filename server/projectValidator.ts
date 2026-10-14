@@ -41,11 +41,21 @@ export function validateGenerationRequest(body: any): ValidationResult {
 
     let totalBytes = 0;
     for (const filePath of fileKeys) {
-      // Validate path security: no path traversal
-      if (filePath.includes('../') || filePath.includes('..\\') || filePath.startsWith('/')) {
+      // Validate path security: no path traversal, null bytes, or system files
+      if (
+        filePath.includes('../') || 
+        filePath.includes('..\\') || 
+        filePath.startsWith('/') || 
+        filePath.startsWith('\\') ||
+        filePath.includes('\0') ||
+        /^[a-zA-Z]:/.test(filePath) ||
+        filePath.startsWith('.env') ||
+        filePath.includes('/.env') ||
+        filePath.startsWith('.git')
+      ) {
         return {
           valid: false,
-          error: `Invalid file path: ${filePath}. Relative traversal or absolute root paths are not permitted.`,
+          error: `Invalid file path: ${filePath}. Relative traversal, drive roots, null bytes, and sensitive files are not permitted.`,
         };
       }
 

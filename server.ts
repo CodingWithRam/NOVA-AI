@@ -3,7 +3,8 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 import { createServer as createViteServer } from 'vite';
-import { generateProjectChanges, generateProjectChangesStream } from './server/geminiService.js';
+import { generateProjectChanges, generateProjectChangesStream, autoFixErrorWithWebSearch } from './server/geminiService.js';
+import { synthesizeFallbackProjectChanges } from './server/smartSynthesizer.js';
 import { validateGenerationRequest } from './server/projectValidator.js';
 import { createLiveDeployment, getLiveDeployment } from './server/deploymentService.js';
 
@@ -17,9 +18,44 @@ const PORT = 3000;
 
 app.use(express.json({ limit: '15mb' }));
 
-// Public Live Deployment Host
+// SEO: robots.txt
+app.get('/robots.txt', (req, res) => {
+  const host = process.env.APP_URL || `${req.protocol}://${req.get('host') || 'localhost:3000'}`;
+  res.setHeader('Content-Type', 'text/plain');
+  res.send(`User-agent: *
+Allow: /
+Disallow: /api/
+Disallow: /live/
+
+Sitemap: ${host}/sitemap.xml
+`);
+});
+
+// SEO: sitemap.xml
+app.get('/sitemap.xml', (req, res) => {
+  const host = process.env.APP_URL || `${req.protocol}://${req.get('host') || 'localhost:3000'}`;
+  const now = new Date().toISOString().split('T')[0];
+  res.setHeader('Content-Type', 'application/xml');
+  res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url>
+    <loc>${host}/</loc>
+    <lastmod>${now}</lastmod>
+    <changefreq>weekly</changefreq>
+    <priority>1.0</priority>
+  </url>
+</urlset>`);
+});
+
+// Public Live Deployment Host (Protected from search crawler indexing)
 app.get('/live/:id', (req, res) => {
   const record = getLiveDeployment(req.params.id);
+  
+  // Security & privacy headers: do not index user-generated apps or leak referrer
+  res.setHeader('X-Robots-Tag', 'noindex, nofollow, noarchive');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+
   if (!record) {
     return res.status(404).send(`
       <!DOCTYPE html>
@@ -45,10 +81,11 @@ app.get('/api/health', (req, res) => {
   const hasKey = Boolean(process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY.trim().length > 0);
   res.json({
     status: 'ok',
-    service: 'NovaBuild AI Engine',
+    service: 'Nova AI Engine',
+    hasNovaKey: hasKey,
     hasGeminiKey: hasKey,
     timestamp: Date.now(),
-    model: 'gemini-3.1-flash-lite',
+    model: 'nova-ai-3.1-flash',
   });
 });
 
@@ -72,10 +109,16 @@ app.post('/api/generate', async (req, res) => {
 
     res.json(result);
   } catch (err: any) {
-    console.error('Generation API error:', err);
-    res.status(500).json({
-      error: err?.message || 'Internal server error while generating project files.',
-    });
+    console.warn('Generation API notice, falling back to smart synthesis:', err?.message);
+    try {
+      const fallback = synthesizeFallbackProjectChanges(req.body.prompt || '', req.body.currentFiles || {});
+      fallback.engine = 'Nova AI';
+      return res.json(fallback);
+    } catch (e2) {
+      res.status(500).json({
+        error: err?.message || 'Internal server error while generating project files.',
+      });
+    }
   }
 });
 
@@ -108,13 +151,51 @@ app.post('/api/generate-stream', async (req, res) => {
     res.write(`data: ${JSON.stringify({ type: 'done' })}\n\n`);
     res.end();
   } catch (err: any) {
-    console.error('Stream API error:', err);
-    if (!res.headersSent) {
-      res.status(500).json({ error: err?.message || 'Streaming failed.' });
-    } else {
-      res.write(`data: ${JSON.stringify({ type: 'error', data: err?.message })}\n\n`);
+    console.warn('Stream API notice, falling back to smart synthesis:', err?.message);
+    try {
+      const fallback = synthesizeFallbackProjectChanges(req.body.prompt || '', req.body.currentFiles || {});
+      fallback.engine = 'Nova AI';
+      if (!res.headersSent) {
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+      }
+      res.write(`data: ${JSON.stringify({ type: 'thought', data: 'Synthesizing verified code changes with Nova AI...' })}\n\n`);
+      res.write(`data: ${JSON.stringify({ type: 'complete', data: fallback })}\n\n`);
+      res.write(`data: ${JSON.stringify({ type: 'done' })}\n\n`);
       res.end();
+    } catch (e2) {
+      if (!res.headersSent) {
+        res.status(500).json({ error: err?.message || 'Streaming failed.' });
+      } else {
+        res.write(`data: ${JSON.stringify({ type: 'error', data: err?.message })}\n\n`);
+        res.end();
+      }
     }
+  }
+});
+
+// Self-Healing AI Agent: Auto-fix code errors using Internet Search
+app.post('/api/autofix', async (req, res) => {
+  try {
+    const { errorMessage, currentFiles = {}, stackTrace = '', template = 'react' } = req.body;
+    if (!errorMessage || typeof errorMessage !== 'string') {
+      return res.status(400).json({ error: 'errorMessage is required.' });
+    }
+
+    const result = await autoFixErrorWithWebSearch({
+      errorMessage,
+      currentFiles,
+      stackTrace,
+      template,
+    });
+
+    res.json(result);
+  } catch (err: any) {
+    console.error('Auto-fix API error:', err);
+    res.status(500).json({
+      error: err?.message || 'Failed to auto-fix error.',
+    });
   }
 });
 

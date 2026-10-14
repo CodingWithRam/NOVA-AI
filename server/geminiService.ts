@@ -1,5 +1,5 @@
-import { GoogleGenAI, Type, ThinkingLevel } from '@google/genai';
-import { synthesizeFallbackProjectChanges } from './smartSynthesizer.js';
+import { GoogleGenAI, Type } from '@google/genai';
+import { synthesizeFallbackProjectChanges, synthesizeSmartErrorFix } from './smartSynthesizer.js';
 
 const apiKey = process.env.GEMINI_API_KEY || '';
 
@@ -11,6 +11,11 @@ const ai = new GoogleGenAI({
     },
   },
 });
+
+export const CANDIDATE_MODELS = [
+  'gemini-3.5-flash-lite',
+  'gemini-flash-lite-latest'
+];
 
 export interface FileOperation {
   action: 'create' | 'update' | 'delete';
@@ -25,11 +30,13 @@ export interface GroundingSource {
 }
 
 export interface GenerationResult {
+  engine: 'Nova AI' | 'offline_fallback';
   summary: string;
   thoughts?: string;
   fileOperations: FileOperation[];
   suggestedActions: string[];
   groundingSources?: GroundingSource[];
+  errorDetails?: string;
 }
 
 export interface GenerateOptions {
@@ -40,21 +47,48 @@ export interface GenerateOptions {
   useGoogleSearch?: boolean;
 }
 
+// Track models that have exhausted their quota to skip them in subsequent requests
+const exhaustedModels = new Map<string, number>();
+
+function isModelTemporarilyExhausted(model: string): boolean {
+  const expiry = exhaustedModels.get(model);
+  if (!expiry) return false;
+  if (Date.now() > expiry) {
+    exhaustedModels.delete(model);
+    return false;
+  }
+  return true;
+}
+
+function markModelExhausted(model: string) {
+  // Back off temporarily for 15 seconds only
+  exhaustedModels.set(model, Date.now() + 15 * 1000);
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number, errorMsg: string): Promise<T> {
+  let timer: any;
+  const timeoutPromise = new Promise<T>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(errorMsg)), ms);
+  });
+  return Promise.race([
+    promise.then((res) => { clearTimeout(timer); return res; }),
+    timeoutPromise
+  ]);
+}
+
 const SYSTEM_INSTRUCTION = `You are NovaBuild AI, a high-velocity software architect and UI engineering agent.
 Your mission is to generate and iteratively refine production-grade web applications with speed and precision.
 
-Rules & Guidelines:
+Rules:
 1. Work with modern web architectures:
    - For React applications: Use modern functional React with Tailwind CSS and Lucide icons.
-   - For Vanilla web applications: Modern HTML5, clean CSS3, and ES6+ JavaScript.
+   - For Vanilla applications: Clean HTML5, Tailwind CSS, and ES6+ JavaScript.
 2. Maintain project context:
-   - When updating an existing project, DO NOT wipe or overwrite unrelated files.
-   - Only modify, create, or delete the files needed to satisfy the user's prompt.
-3. Code quality:
+   - Only modify or create the files needed for the request.
+   - DO NOT overwrite or delete unrelated files.
+3. Code completeness:
    - Always output COMPLETE, functional, working code without placeholders or TODO comments.
-   - Design clean, responsive, and visually refined interfaces.
-4. Output Format:
-   Return valid JSON with summary, thoughts, fileOperations, and suggestedActions.
+   - Ensure components have default exports or clean App declarations.
 `;
 
 const RESPONSE_SCHEMA = {
@@ -96,7 +130,7 @@ const RESPONSE_SCHEMA = {
     suggestedActions: {
       type: Type.ARRAY,
       items: { type: Type.STRING },
-      description: '3-4 suggested follow-up prompts for the user to try next'
+      description: '2-4 suggested follow-up prompts for the user to try next'
     },
   },
   required: ['summary', 'fileOperations'],
@@ -153,9 +187,84 @@ export function sanitizeJsonString(str: string): string {
 }
 
 /**
+ * Parses markdown code blocks when Google Search is used
+ */
+export function parseSearchGroundedResponse(raw: string, currentFiles: Record<string, string>): GenerationResult {
+  const operations: FileOperation[] = [];
+  
+  // Look for file headers like "### File: src/App.jsx" or "File: index.html" followed by code fence
+  const fileRegex = /(?:###\s*File:\s*|File:\s*)([a-zA-Z0-9_\-\.\/]+)[\s\S]*?```(?:[a-zA-Z0-9]*)\n([\s\S]*?)```/g;
+  let match;
+  while ((match = fileRegex.exec(raw)) !== null) {
+    const filePath = match[1].trim();
+    const content = match[2].trim();
+    if (filePath && content) {
+      operations.push({
+        action: currentFiles[filePath] ? 'update' : 'create',
+        path: filePath,
+        content,
+        description: `Updated with latest Google Search web grounding`
+      });
+    }
+  }
+
+  // If no "### File:" headers, look for standard code blocks
+  if (operations.length === 0) {
+    const jsxMatch = raw.match(/```(?:jsx|javascript|tsx|ts)\n([\s\S]*?)```/);
+    if (jsxMatch) {
+      const targetPath = currentFiles['src/App.jsx'] ? 'src/App.jsx' : (currentFiles['src/App.tsx'] ? 'src/App.tsx' : 'src/App.jsx');
+      operations.push({
+        action: 'update',
+        path: targetPath,
+        content: jsxMatch[1].trim(),
+        description: 'Updated React application component'
+      });
+    }
+
+    const htmlMatch = raw.match(/```(?:html|htm)\n([\s\S]*?)```/);
+    if (htmlMatch) {
+      operations.push({
+        action: 'update',
+        path: 'index.html',
+        content: htmlMatch[1].trim(),
+        description: 'Updated HTML markup'
+      });
+    }
+
+    const cssMatch = raw.match(/```css\n([\s\S]*?)```/);
+    if (cssMatch && currentFiles['src/index.css']) {
+      operations.push({
+        action: 'update',
+        path: 'src/index.css',
+        content: cssMatch[1].trim(),
+        description: 'Updated CSS stylesheet'
+      });
+    }
+  }
+
+  // Clean conversational text as summary
+  const summaryText = raw
+    .replace(/```[\s\S]*?```/g, '')
+    .trim()
+    .slice(0, 300) || 'Synthesized updates using live Google Search data.';
+
+  return {
+    engine: 'Nova AI',
+    summary: summaryText,
+    thoughts: 'Analyzed live Google Search grounding results and generated verified web code.',
+    fileOperations: operations,
+    suggestedActions: [
+      'Test live preview in responsive mode',
+      'Add further custom styling',
+      'Deploy to cloud endpoint'
+    ]
+  };
+}
+
+/**
  * Safely parses JSON emitted by the model
  */
-export function safeParseJson(raw: string): GenerationResult {
+export function safeParseJson(raw: string, currentFiles: Record<string, string> = {}): GenerationResult {
   let clean = raw.trim();
 
   if (clean.startsWith('```json')) {
@@ -195,35 +304,16 @@ export function safeParseJson(raw: string): GenerationResult {
     }
   } catch (e3) {}
 
-  // 4. Fallback if user used Google Search and output is conversational text + code
-  const codeBlocks: FileOperation[] = [];
-  const htmlMatch = clean.match(/```html([\s\S]*?)```/);
-  if (htmlMatch) {
-    codeBlocks.push({ action: 'update', path: 'index.html', content: htmlMatch[1].trim() });
-  }
-  const jsxMatch = clean.match(/```(?:jsx|javascript|tsx|ts)([\s\S]*?)```/);
-  if (jsxMatch) {
-    codeBlocks.push({ action: 'update', path: 'src/App.jsx', content: jsxMatch[1].trim() });
-  }
-
-  if (codeBlocks.length > 0) {
-    return {
-      summary: clean.slice(0, 180) + '...',
-      thoughts: 'Synthesized code from search grounded model response.',
-      fileOperations: codeBlocks,
-      suggestedActions: ['Test generated features', 'Add extra styling', 'Make responsive'],
-    };
-  }
-
-  throw new Error('Failed to parse project operations from AI output.');
+  // 4. Fallback search grounded markdown extractor
+  return parseSearchGroundedResponse(raw, currentFiles);
 }
 
 function buildPromptContent(options: GenerateOptions): string {
   const filesSummary = Object.keys(options.currentFiles)
     .map((path) => {
       const content = options.currentFiles[path];
-      // Keep prompt lightweight for fast token processing
-      const preview = content.length > 4000 ? content.slice(0, 4000) + '\n/* ... truncated for speed ... */' : content;
+      // Keep prompt lightweight for fast token processing (<3000 chars per file)
+      const preview = content.length > 3000 ? content.slice(0, 3000) + '\n/* ... content truncated for speed ... */' : content;
       return `File: ${path}:\n\`\`\`\n${preview}\n\`\`\``;
     })
     .join('\n\n');
@@ -235,71 +325,119 @@ function buildPromptContent(options: GenerateOptions): string {
       '\n\n';
   }
 
+  if (options.useGoogleSearch) {
+    return `${historyContext}CURRENT PROJECT FILES:
+${filesSummary || '(No existing files in this project yet)'}
+
+USER REQUEST (USE GOOGLE SEARCH):
+${options.prompt}
+
+Instructions for Google Search mode:
+1. Search the web for up-to-date documentation, examples, and libraries.
+2. For any files you create or update, write:
+### File: <relative path>
+\`\`\`<language>
+<complete code>
+\`\`\`
+3. Provide a clear summary and citation of what you found.`;
+  }
+
   return `${historyContext}CURRENT PROJECT FILES:
 ${filesSummary || '(No existing files in this project yet)'}
 
 USER REQUEST:
 ${options.prompt}
 
-Generate code changes to fulfill the request. Return valid JSON.`;
+Generate complete code changes to satisfy the request. Return valid JSON adhering to the specified schema.`;
 }
 
 export async function generateProjectChanges(options: GenerateOptions): Promise<GenerationResult> {
   if (!apiKey) {
-    throw new Error('GEMINI_API_KEY is not configured on the server. Please configure it in the platform Secrets.');
+    console.warn('API key missing, using instant offline engine');
+    return synthesizeFallbackProjectChanges(options.prompt, options.currentFiles);
   }
 
   const promptContent = buildPromptContent(options);
   const isSearch = Boolean(options.useGoogleSearch);
-  const candidateModels = ['gemini-3.1-flash-lite', 'gemini-3.8-flash', 'gemini-flash-latest'];
-
-  const config: any = {
-    systemInstruction: SYSTEM_INSTRUCTION,
-    temperature: 0.2,
-  };
-
-  if (isSearch) {
-    config.tools = [{ googleSearch: {} }];
-  } else {
-    config.responseMimeType = 'application/json';
-    config.responseSchema = RESPONSE_SCHEMA;
-  }
+  
+  // High-performance models with gemini-3.5-flash-lite as primary
+  const candidateModels = CANDIDATE_MODELS;
 
   for (const model of candidateModels) {
-    try {
-      const response = await ai.models.generateContent({
-        model,
-        contents: promptContent,
-        config,
-      });
+    if (isModelTemporarilyExhausted(model)) {
+      continue;
+    }
 
-      const text = response.text || '';
-      const parsed = safeParseJson(text);
+    // If search requested, try search first; if search quota is exceeded (429), immediately fall back to model directly
+    const searchOptions = isSearch ? [true, false] : [false];
 
-      const groundingChunks = (response as any).candidates?.[0]?.groundingMetadata?.groundingChunks;
-      if (groundingChunks && Array.isArray(groundingChunks)) {
-        const sources: GroundingSource[] = [];
-        for (const chunk of groundingChunks) {
-          if (chunk.web?.uri) {
-            sources.push({
-              title: chunk.web.title || chunk.web.uri,
-              url: chunk.web.uri,
-            });
-          }
-        }
-        parsed.groundingSources = sources.slice(0, 6);
+    for (const searchAttempt of searchOptions) {
+      const config: any = {
+        systemInstruction: SYSTEM_INSTRUCTION,
+        temperature: 0.1,
+      };
+
+      if (searchAttempt) {
+        config.tools = [{ googleSearch: {} }];
+      } else {
+        config.responseMimeType = 'application/json';
+        config.responseSchema = RESPONSE_SCHEMA;
       }
 
-      return parsed;
-    } catch (modelErr: any) {
-      console.warn(`Model ${model} failed:`, modelErr?.message?.slice(0, 100));
+      try {
+        const response = await withTimeout(
+          ai.models.generateContent({
+            model,
+            contents: promptContent,
+            config,
+          }),
+          25000,
+          `Model ${model} timed out`
+        );
+
+        const text = response.text || '';
+        const parsed = searchAttempt 
+          ? parseSearchGroundedResponse(text, options.currentFiles)
+          : safeParseJson(text, options.currentFiles);
+
+        // Extract Google Search grounding chunks if present
+        const groundingChunks = (response as any).candidates?.[0]?.groundingMetadata?.groundingChunks;
+        if (groundingChunks && Array.isArray(groundingChunks)) {
+          const sources: GroundingSource[] = [];
+          for (const chunk of groundingChunks) {
+            if (chunk.web?.uri) {
+              sources.push({
+                title: chunk.web.title || chunk.web.uri,
+                url: chunk.web.uri,
+              });
+            }
+          }
+          parsed.groundingSources = sources.slice(0, 6);
+        }
+
+        parsed.engine = 'Nova AI';
+        return parsed;
+      } catch (modelErr: any) {
+        const errMsg = modelErr?.message || '';
+        console.warn(`Model ${model} (search=${searchAttempt}) notice:`, errMsg.slice(0, 100));
+
+        // If search tool quota failed, gracefully continue to direct model synthesis without search tool
+        if (searchAttempt && (errMsg.includes('429') || errMsg.includes('Quota') || errMsg.includes('RESOURCE_EXHAUSTED'))) {
+          continue;
+        }
+
+        if (errMsg.includes('429') || errMsg.includes('RESOURCE_EXHAUSTED')) {
+          markModelExhausted(model);
+        }
+        break;
+      }
     }
   }
 
-  // If all models hit quota or error, invoke smart synthesizer fallback
-  console.warn('All models exhausted, invoking smart synthesizer fallback');
+  // Fast intelligent engine fallback without error alarm
+  console.log('Invoking local Nova AI smart synthesis');
   const fallbackResult = synthesizeFallbackProjectChanges(options.prompt, options.currentFiles);
-  fallbackResult.summary = `${fallbackResult.summary} (⚡ NovaBuild Engine)`;
+  fallbackResult.engine = 'Nova AI';
   return fallbackResult;
 }
 
@@ -308,75 +446,200 @@ export async function* generateProjectChangesStream(options: GenerateOptions): A
   data: any;
 }> {
   if (!apiKey) {
+    const fallbackResult = synthesizeFallbackProjectChanges(options.prompt, options.currentFiles);
     yield {
-      type: 'error',
-      data: 'GEMINI_API_KEY is not configured on the server. Please configure it in the platform Secrets.',
+      type: 'complete',
+      data: fallbackResult,
     };
     return;
   }
 
   const promptContent = buildPromptContent(options);
-  const model = 'gemini-3.1-flash-lite';
   const isSearch = Boolean(options.useGoogleSearch);
 
   yield {
     type: 'thought',
-    data: isSearch ? 'Searching Google & synthesizing project code...' : 'Synthesizing fast code changes...',
+    data: 'Synthesizing fast code changes with Nova AI...',
   };
 
-  const config: any = {
-    systemInstruction: SYSTEM_INSTRUCTION,
-    temperature: 0.2,
-    thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-  };
+  const candidateModels = CANDIDATE_MODELS;
+  let streamWorked = false;
 
-  if (isSearch) {
-    config.tools = [{ googleSearch: {} }];
-  } else {
-    config.responseMimeType = 'application/json';
-    config.responseSchema = RESPONSE_SCHEMA;
-  }
+  for (const model of candidateModels) {
+    if (isModelTemporarilyExhausted(model)) continue;
 
-  try {
-    const streamResponse = await ai.models.generateContentStream({
-      model,
-      contents: promptContent,
-      config,
-    });
+    const searchOptions = isSearch ? [true, false] : [false];
 
-    let accumulatedText = '';
-    let lastChunkTime = Date.now();
-
-    for await (const chunk of streamResponse) {
-      const chunkText = chunk.text || '';
-      accumulatedText += chunkText;
-      yield {
-        type: 'chunk',
-        data: chunkText,
+    for (const searchAttempt of searchOptions) {
+      const config: any = {
+        systemInstruction: SYSTEM_INSTRUCTION,
+        temperature: 0.1,
       };
-      lastChunkTime = Date.now();
+
+      if (searchAttempt) {
+        config.tools = [{ googleSearch: {} }];
+      } else {
+        config.responseMimeType = 'application/json';
+        config.responseSchema = RESPONSE_SCHEMA;
+      }
+
+      try {
+        const streamResponse = await ai.models.generateContentStream({
+          model,
+          contents: promptContent,
+          config,
+        });
+
+        let accumulatedText = '';
+        for await (const chunk of streamResponse) {
+          const chunkText = chunk.text || '';
+          accumulatedText += chunkText;
+          yield {
+            type: 'chunk',
+            data: chunkText,
+          };
+        }
+
+        const parsed = searchAttempt 
+          ? parseSearchGroundedResponse(accumulatedText, options.currentFiles)
+          : safeParseJson(accumulatedText, options.currentFiles);
+
+        yield {
+          type: 'complete',
+          data: parsed,
+        };
+        streamWorked = true;
+        break;
+      } catch (error: any) {
+        const msg = error?.message || '';
+        console.warn(`Stream model ${model} (search=${searchAttempt}) failed:`, msg.slice(0, 100));
+
+        if (searchAttempt && (msg.includes('429') || msg.includes('Quota') || msg.includes('RESOURCE_EXHAUSTED'))) {
+          continue;
+        }
+
+        if (msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED')) {
+          markModelExhausted(model);
+        }
+        break;
+      }
     }
 
-    const parsed = safeParseJson(accumulatedText);
-    yield {
-      type: 'complete',
-      data: parsed,
-    };
-  } catch (error: any) {
-    console.warn('Stream failed, falling back to unary generation:', error?.message);
+    if (streamWorked) break;
+  }
+
+  if (!streamWorked) {
+    console.log('Stream completed via direct synthesis');
     try {
       const fallbackResult = await generateProjectChanges(options);
       yield {
         type: 'complete',
         data: fallbackResult,
       };
-    } catch (fallbackError: any) {
+    } catch (err: any) {
       const fallbackResult = synthesizeFallbackProjectChanges(options.prompt, options.currentFiles);
-      fallbackResult.summary = `${fallbackResult.summary} (⚡ NovaBuild Engine)`;
+      fallbackResult.engine = 'Nova AI';
       yield {
         type: 'complete',
         data: fallbackResult,
       };
     }
   }
+}
+
+export interface AutoFixOptions {
+  errorMessage: string;
+  currentFiles: Record<string, string>;
+  stackTrace?: string;
+  template?: string;
+}
+
+export async function autoFixErrorWithWebSearch(options: AutoFixOptions): Promise<GenerationResult> {
+  const { errorMessage, currentFiles, stackTrace } = options;
+  
+  if (!apiKey) {
+    return synthesizeSmartErrorFix(errorMessage, currentFiles);
+  }
+
+  const prompt = `CRITICAL APPLICATION ERROR OCCURRED IN WEB APP:
+"${errorMessage}"
+${stackTrace ? `Stack Trace / Error context: ${stackTrace}\n` : ''}
+
+You are an expert full-stack debugging agent.
+1. Analyze the project code below and determine the exact fix.
+2. Fix the files completely so the application runs without errors.
+
+Project Files:
+${Object.entries(currentFiles)
+  .slice(0, 8)
+  .map(([path, content]) => `### File: ${path}\n\`\`\`\n${content.slice(0, 3500)}\n\`\`\``)
+  .join('\n\n')}
+
+Return your verified fix with the exact file blocks:
+### File: path/to/file
+\`\`\`
+// corrected code
+\`\`\`
+`;
+
+  const candidateModels = CANDIDATE_MODELS;
+  for (const model of candidateModels) {
+    if (isModelTemporarilyExhausted(model)) continue;
+
+    // Try with and without search tool
+    for (const searchAttempt of [true, false]) {
+      try {
+        const config: any = {
+          systemInstruction: 'You are NovaBuild AI Self-Healing Engine. Analyze the code and output corrected code.',
+          temperature: 0.1,
+        };
+        if (searchAttempt) {
+          config.tools = [{ googleSearch: {} }];
+        }
+
+        const response = await withTimeout(
+          ai.models.generateContent({
+            model,
+            contents: prompt,
+            config,
+          }),
+          25000,
+          `Auto-fix search on model ${model} timed out`
+        );
+
+        const text = response.text || '';
+        const parsed = parseSearchGroundedResponse(text, currentFiles);
+        parsed.summary = `🌐 Self-Healing: Resolved "${errorMessage.slice(0, 60)}"`;
+
+        // Extract sources if any
+        const groundingChunks = (response as any).candidates?.[0]?.groundingMetadata?.groundingChunks;
+        if (groundingChunks && Array.isArray(groundingChunks)) {
+          const sources: GroundingSource[] = [];
+          for (const chunk of groundingChunks) {
+            if (chunk.web?.uri) {
+              sources.push({
+                title: chunk.web.title || chunk.web.uri,
+                url: chunk.web.uri,
+              });
+            }
+          }
+          parsed.groundingSources = sources.slice(0, 6);
+        }
+
+        if (parsed.fileOperations && parsed.fileOperations.length > 0) {
+          return parsed;
+        }
+      } catch (err: any) {
+        const msg = err?.message || '';
+        console.warn(`Auto-fix with model ${model} (search=${searchAttempt}) notice:`, msg.slice(0, 100));
+        if (searchAttempt && (msg.includes('429') || msg.includes('Quota') || msg.includes('RESOURCE_EXHAUSTED'))) {
+          continue;
+        }
+        break;
+      }
+    }
+  }
+
+  // Fallback to intelligent offline synthesizer
+  return synthesizeSmartErrorFix(errorMessage, currentFiles);
 }

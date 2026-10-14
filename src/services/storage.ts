@@ -1,4 +1,4 @@
-import { Project, ProjectVersion, UserProfile, TemplateType } from '../types';
+import { Project, ProjectVersion, UserProfile, TemplateType, RegisteredAccount } from '../types';
 import { STARTER_TEMPLATES } from './templates';
 
 export const DEFAULT_USERS: UserProfile[] = [
@@ -6,6 +6,7 @@ export const DEFAULT_USERS: UserProfile[] = [
     id: 'user_alex',
     name: 'Alex Rivera',
     email: 'alex.rivera@novabuild.internal',
+    provider: 'workspace',
     avatar: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=128&q=80',
     role: 'Lead Architect',
   },
@@ -13,6 +14,7 @@ export const DEFAULT_USERS: UserProfile[] = [
     id: 'user_maya',
     name: 'Maya Chen',
     email: 'maya.chen@novabuild.internal',
+    provider: 'workspace',
     avatar: 'https://images.unsplash.com/photo-1517841905240-472988babdf9?auto=format&fit=crop&w=128&q=80',
     role: 'Product Engineer',
   },
@@ -20,6 +22,7 @@ export const DEFAULT_USERS: UserProfile[] = [
     id: 'user_guest',
     name: 'Guest Developer',
     email: 'guest@novabuild.internal',
+    provider: 'guest',
     avatar: 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=128&q=80',
     role: 'Explorer',
   },
@@ -27,6 +30,30 @@ export const DEFAULT_USERS: UserProfile[] = [
 
 const STORAGE_KEY_PREFIX = 'novabuild_projects_';
 const CURRENT_USER_KEY = 'novabuild_active_user';
+const REGISTERED_ACCOUNTS_KEY = 'novabuild_registered_accounts';
+
+export function getRegisteredAccounts(): RegisteredAccount[] {
+  try {
+    const raw = localStorage.getItem(REGISTERED_ACCOUNTS_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) return parsed;
+    }
+  } catch (e) {
+    // ignore
+  }
+  return [];
+}
+
+export function saveRegisteredAccount(account: RegisteredAccount): void {
+  try {
+    const existing = getRegisteredAccounts();
+    const filtered = existing.filter((a) => a.id !== account.id && a.email !== account.email && (!account.phone || a.phone !== account.phone));
+    localStorage.setItem(REGISTERED_ACCOUNTS_KEY, JSON.stringify([account, ...filtered]));
+  } catch (e) {
+    console.error('Failed to save registered account:', e);
+  }
+}
 
 export function getActiveUser(): UserProfile {
   try {
@@ -44,6 +71,19 @@ export function setActiveUser(user: UserProfile): void {
   } catch (e) {
     // ignore
   }
+}
+
+export function logoutActiveUser(): UserProfile {
+  const guestUser: UserProfile = {
+    id: `guest_${Date.now()}`,
+    name: 'Guest Developer',
+    email: 'guest@novabuild.local',
+    provider: 'guest',
+    avatar: 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=128&q=80',
+    role: 'Guest Developer',
+  };
+  setActiveUser(guestUser);
+  return guestUser;
 }
 
 export function loadProjectsForUser(userId: string): Project[] {
@@ -158,3 +198,32 @@ export function restoreProjectToVersion(project: Project, versionId: string): Pr
 
   return createVersionSnapshot(updatedProject, `Restored to version ${ver.versionNumber}: ${ver.summary}`);
 }
+
+export function deleteVersionSnapshot(project: Project, versionId: string): Project {
+  if (!project.versions || project.versions.length <= 1) return project;
+  const filtered = project.versions.filter((v) => v.id !== versionId);
+  return {
+    ...project,
+    updatedAt: Date.now(),
+    versions: filtered,
+  };
+}
+
+export function cleanProjectHistory(project: Project): Project {
+  if (!project.versions || project.versions.length <= 1) return project;
+  // Keep the latest version snapshot and make it v1
+  const latest = project.versions[project.versions.length - 1];
+  const cleanedVer: ProjectVersion = {
+    ...latest,
+    id: `v_${Date.now()}_1`,
+    versionNumber: 1,
+    summary: `Cleaned checkpoint: ${latest.summary}`,
+    timestamp: Date.now(),
+  };
+  return {
+    ...project,
+    updatedAt: Date.now(),
+    versions: [cleanedVer],
+  };
+}
+

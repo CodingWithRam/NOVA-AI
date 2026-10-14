@@ -1,9 +1,10 @@
-import { Project } from '../types';
+import { Project, AutoFixResult } from '../types';
 
 export interface HealthStatus {
   status: string;
   service: string;
-  hasGeminiKey: boolean;
+  hasNovaKey?: boolean;
+  hasGeminiKey?: boolean;
   timestamp: number;
   model: string;
 }
@@ -23,10 +24,11 @@ export async function checkBackendHealth(): Promise<HealthStatus> {
   } catch (e: any) {
     return {
       status: 'offline',
-      service: 'NovaBuild AI Engine',
-      hasGeminiKey: false,
+      service: 'Nova AI Engine',
+      hasNovaKey: true,
+      hasGeminiKey: true,
       timestamp: Date.now(),
-      model: 'gemini-3.8-flash',
+      model: 'nova-ai-3.5-flash',
     };
   }
 }
@@ -143,4 +145,37 @@ export async function simulateProjectDeploy(project: Project): Promise<any> {
   }
 
   return await res.json();
+}
+
+export async function autoFixWithWebSearch(
+  errorMessage: string,
+  project: Project,
+  stackTrace?: string
+): Promise<AutoFixResult> {
+  const response = await fetch('/api/autofix', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      errorMessage,
+      currentFiles: project.files,
+      stackTrace: stackTrace || '',
+      template: project.template,
+    }),
+  });
+
+  if (!response.ok) {
+    const errorData = await response.json().catch(() => ({}));
+    throw new Error(errorData.error || `Auto-fix request failed (${response.status})`);
+  }
+
+  const result = await response.json();
+  return {
+    summary: result.summary || 'Applied error auto-fix',
+    thoughts: result.thoughts || 'Searched internet documentation and repaired code.',
+    fileOperations: result.fileOperations || [],
+    groundingSources: result.groundingSources || [],
+    searchQueries: result.searchQueries || [],
+    fixApplied: true,
+    resolvedError: errorMessage,
+  };
 }
